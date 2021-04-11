@@ -1,0 +1,809 @@
+---
+title: "Kaggle Competition Documentation - DS2 Exam"
+author: "Cosmin Catalin Ticu"
+date: "4/10/2021"
+output:   
+  prettydoc::html_pretty:
+    theme: cayman
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T,message = F,warning = F,cache = F)
+```
+
+# Preface & Package Loading
+
+The Github repo for this Kaggle competition project can be found [here](https://github.com/cosmin-ticu/kaggle-classification-competition).
+
+```{r}
+rm(list = ls())
+library(tidyverse) # for data manipulation
+library(h2o) # for building models
+library(skimr) # summary statistics
+library(GGally) # variable correlations
+h2o.init(min_mem_size = '4g', max_mem_size = '8g') # pick more capable memory
+my_seed <- 12345
+```
+
+# Introduction
+
+The goal of this report is to summarize the efforts to build complex predictive models in order to classify whether an article of a certain type and of certain SEO features will be popular or not. The dataset comes from Mashable and it has been redistributed through the [CEU MS BA Kaggle Competition 2021](https://www.kaggle.com/c/ml2021ceuba). The goal of the competition is to achieve a minimum AUC on validation/test set above 0.65. All of the models employed within this study achieved this metric, as no baseline logit or probit models were used, thus directly jumping to more complex predictions.
+
+# Data Cleaning
+
+```{r}
+# import data
+train <- read_csv("F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/data/train.csv")
+test <- read_csv("F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/data/test.csv")
+```
+
+After loading in the training and test set, we observe the structure of either of the datasets to see the variables that we are dealing with.
+
+```{r}
+# check variable types
+str(train)
+```
+
+There are 27752 observations in the train set, while the test set has 11892 observations. A total of 60 features are present in the dataset, some spanning factor, some dummy and some numeric variables all relating to SEO measures such as article tokens, sentiment, rate of word appearance, mentions etc. With the aim of predicting whether an article is popular or not, we aim to select all the worthwhile variables without jeopardizing predictability or multicollinearity.
+
+The first change we make pertains to the factor variables to be converted into actual factors readable by R.
+
+```{r}
+my_fun <- function(x) { 
+      x %>% mutate(
+    data_channel_is_lifestyle = factor(data_channel_is_lifestyle),
+    data_channel_is_entertainment = factor(data_channel_is_entertainment),
+    data_channel_is_bus = factor(data_channel_is_bus),
+    data_channel_is_socmed = factor(data_channel_is_socmed),
+    data_channel_is_tech = factor(data_channel_is_tech),
+    data_channel_is_world = factor(data_channel_is_world),
+    weekday_is_monday = factor(weekday_is_monday),
+    weekday_is_tuesday = factor(weekday_is_tuesday),
+    weekday_is_wednesday = factor(weekday_is_wednesday),
+    weekday_is_thursday = factor(weekday_is_thursday),
+    weekday_is_friday = factor(weekday_is_friday),
+    weekday_is_saturday = factor(weekday_is_saturday),
+    weekday_is_sunday = factor(weekday_is_sunday),
+    is_weekend = factor(is_weekend),
+    article_id = factor(article_id),
+)
+}
+result <- list( train, test ) %>%
+    lapply( my_fun )
+train <- result[[1]]
+test <- result[[2]]
+
+# convert outcome variable to a 2 level factor
+train <- train %>%
+  mutate(is_popular = factor(is_popular, levels = c(0,1), labels = c('no','yes')))
+```
+
+Looking at the class and type of each variable, we see that we are only dealing with numeric values, sometimes found in continous variables and sometimes in factorized variables.
+
+```{r}
+#display the class and type of each columns
+sapply(train, class)
+sapply(train, typeof)
+```
+
+Searching for missing values:
+
+```{r}
+# where do we have missing values?
+to_filter <- sapply(setdiff(names(train),'is_popular'), function(x) sum(is.na(x)))
+print(paste("The following columns contain missing values", to_filter[to_filter > 0]))
+# no missing values
+```
+
+As we can see, no columns contain any missing values. This allows us to proceed with skimming the data and obtaining summary statistics to determine the best feature engineering practices.
+
+```{r}
+# taking a look at all the variables (identify skews for feature engineering)
+skim(train)
+```
+
+Skimming the variables, we notice a few that are skewed. Ideally, to achieve the absolute best AUC performance, one would convert all the skewed variables to log and then employ both their level and log forms in the final model. However, for the sake of good statistical conduct, we convert the skewed variables to log to use in a different predictor set in order to benchmark against the level variables.
+
+# Feature Engineering
+
+Looking at the correlations between extremely similar variables, we notice:
+
+```{r}
+# check correlations between polarity and subjectivity measures
+ggcorr(subset(train,select = c(avg_positive_polarity,min_positive_polarity,max_positive_polarity,
+                               avg_negative_polarity,min_negative_polarity,max_negative_polarity)))
+# check correlations between keyword measures
+ggcorr(subset(train,select = c(kw_min_min, kw_max_min, kw_avg_min, 
+                               kw_min_max, kw_max_max, kw_avg_max,
+                               kw_min_avg, kw_max_avg, kw_avg_avg)))
+# drop averages keep mins & maxs
+```
+
+As the measures for polarity are plentiful, so are the multicollinearity possibilities. As such, as we are interested in a model that is not overfitted, we aim to remove the variables that highly correlate with each other (above 80% is a standard benchmark). One could choose to either keep the averages or keep only the mins and maxes. For the sake of achieving a better performance from a more complex model, we get rid of the averages of all the polarity and keyword share metrics.
+
+```{r}
+# check correlations between word measures
+ggcorr(subset(train,select = c(n_tokens_title, n_tokens_content, 
+                               n_unique_tokens, n_non_stop_words, 
+                               n_non_stop_unique_tokens)))
+# exclude rate of unique tokens as correlation with rate of non-stop unique tokens
+# is extremely high (as expected)
+```
+
+Looking at the correlations between the token variables, it is not worthwhile to keep the unique and non-unique counterparts as they might overfit the model. As such, we check to see the distribution of the rate of non stop words.
+
+```{r}
+# n_non_stop_words is almost always 1 so I exclude it
+print(paste("There are",
+            nrow(train %>% dplyr::filter(n_non_stop_words > 0.99)),
+            "observations where the rate of non-stop words is over 99%"))
+```
+
+As n_non_stop_words (rate of non-stop words) is almost always 1 (over 90% of cases), I will exclude it from this analysis.
+
+A better measure of self references is rather in percentages than absolute values, as it is also makes more sense to the researcher and to SEO standards.
+
+```{r}
+# add the links to Mashable.com as the percentage of the total links in the article
+train <- train %>% mutate(
+  perc_self_hrefs = ifelse( num_hrefs == 0, 0, num_self_hrefs / num_hrefs))
+test <- test %>% mutate(
+  perc_self_hrefs = ifelse( num_hrefs == 0, 0, num_self_hrefs / num_hrefs))
+```
+
+Accordingly, we proceed to remove all redundant variables, highly correlated ones and one of the rates for positive or negative words as they signal the exact same matter (they are just % opposites). Furthermore, the weekend dummy variable is excluded as there are already dummies for each day of the week.
+
+```{r}
+# rate_positive_words and rate_negative_words sum up to 1 --> keep only one
+# remove redundant is_weekend as weekday dummies already exist
+to_drop <- c("rate_negative_words", "abs_title_subjectivity", 
+             "abs_title_sentiment_polarity", "avg_positive_polarity", 
+             "avg_negative_polarity", "is_weekend", 
+             "self_reference_avg_sharess", "kw_min_avg", "kw_max_avg", 
+             "kw_avg_avg", "kw_avg_min", "kw_avg_max","num_self_hrefs", 
+             "n_non_stop_words", "n_unique_tokens")
+
+# drop listed variables
+train <- subset(train, select = setdiff(names(train), to_drop))
+test <- subset(test, select = setdiff(names(test), to_drop))
+```
+
+Looking at the variables that have values lower than 0, we aim to check whether they have the right values or whether some contain negatives which should not be there.
+
+```{r}
+# check the variables which have values lower than 0 
+temp <- Filter(is.numeric, train)
+for (col in names(temp)){
+  min <- min(temp[,col])
+  if (min < 0){
+   print(c(col, min)) 
+  } else {
+    next
+  }
+}
+# some of them cannot be negative
+
+print(paste("There are",
+            nrow(train %>% dplyr::filter(kw_min_min < 0)),
+            "observations (over 50% of dataset) where the minimum number of shares is negative"))
+```
+
+As is the case with the minimum of the minimum of number of keyword shares, we remove the variable. The number of keyword shares should never be negative. At its lowest it should be 0, thus signaling no shares.
+
+```{r}
+# drop that stuff
+
+train <- subset(train, select = setdiff(names(train), "kw_min_min"))
+test <- subset(test, select = setdiff(names(test), "kw_min_min"))
+```
+
+Looking at correlations between all of the kept variables, we do not observe any more highly correlated variables.
+
+```{r}
+# Correlation matrix of all kept variables
+ggcorr(Filter(is.numeric, train))
+```
+
+We now proceed to add log values to the designated skewed numeric variables. For the values that are either 0 or negative, we proceed either with data imputation of a 1 for absolute count measures and with the inputation of half of the mean for the non-count values. The addition of half of the mean value is a common choice in data imputation when logs are created.
+
+```{r}
+# add logs of skewed features to train
+my_fun_log <- function(x) { 
+      x %>% mutate(
+  log_n_tokens_content = ifelse(n_tokens_content == 0, log(n_tokens_content+1), log(n_tokens_content)),
+  log_n_non_stop_unique_tokens = ifelse(n_non_stop_unique_tokens == 0, log(n_non_stop_unique_tokens+1), log(n_non_stop_unique_tokens)),             
+  log_num_hrefs = ifelse(num_hrefs == 0, log(num_hrefs+1), log(num_hrefs)),           
+  log_num_imgs = ifelse(num_imgs == 0, log(num_imgs+1), log(num_imgs)), 
+  log_num_videos = ifelse(num_videos == 0, log(num_videos+1), log(num_videos)),
+  log_kw_max_min = ifelse(kw_max_min == 0, log(kw_max_min+1), log(kw_max_min)),   
+  log_kw_min_max = ifelse(kw_min_max == 0, log(kw_min_max+1), log(kw_min_max)),
+  log_self_reference_min_shares = ifelse(self_reference_min_shares == 0, log(self_reference_min_shares+1), log(self_reference_min_shares)),
+  log_self_reference_max_shares = ifelse(self_reference_max_shares == 0, log(self_reference_max_shares+1), log(self_reference_max_shares)),
+  log_LDA_00 = ifelse(LDA_00 == 0, log(LDA_00+ mean(LDA_00)/2), log(LDA_00)),
+  log_LDA_01 = ifelse(LDA_01 == 0, log(LDA_01+ mean(LDA_01)/2), log(LDA_01)),
+  log_LDA_02 = ifelse(LDA_02 == 0, log(LDA_02+ mean(LDA_02)/2), log(LDA_02)),
+  log_LDA_03 = ifelse(LDA_03 == 0, log(LDA_03+ mean(LDA_03)/2), log(LDA_03)),
+  log_LDA_04 = ifelse(LDA_04 == 0, log(LDA_04+ mean(LDA_04)/2), log(LDA_04)),
+  log_global_rate_negative_words = ifelse(global_rate_negative_words == 0, log(global_rate_negative_words+ mean(global_rate_negative_words)/2), log(global_rate_negative_words)),
+  log_min_positive_polarity = ifelse(min_positive_polarity == 0, log(min_positive_polarity+mean(min_positive_polarity)/2), log(min_positive_polarity))
+)
+}
+result_log <- list( train, test ) %>%
+    lapply( my_fun_log )
+train <- result_log[[1]]
+test <- result_log[[2]]
+```
+
+# Modelling Choices
+
+Creating the predictor sets, we have a set with level numeric variables and one with log numeric variables.
+
+```{r}
+# create predictor sets
+y <- 'is_popular'
+
+# keep first 45 vars for level
+x_level <- setdiff(names(train[, 1:45]), c("is_popular", "article_id"))
+
+# set diff to level vars for log
+x_log <- setdiff(names(train), c("is_popular", "article_id", 
+                                 "n_tokens_content", "n_non_stop_unique_tokens", 
+                                 "num_hrefs", "num_imgs", "num_videos", 
+                                 "kw_max_min", "kw_min_max", 
+                                 "self_reference_min_shares", 
+                                 "self_reference_max_shares", 
+                                 "LDA_00", "LDA_01", "LDA_02", "LDA_03", "LDA_04", 
+                                 "global_rate_negative_words", "min_positive_polarity"))
+```
+
+# Predictive Modelling
+
+Five types of models were used for this analysis spanning Random Forest, Gradient Boosting, Penalized Linear (Lasso & Ridge), NN (an XGBoost was unfortunately not possible due to its incompatibility with h2o on Windows) and, finally, a combination of all the previous five under a stacked ensemble model. 5-fold cross-validation was used as a measure of avoiding overfitting. The R package of choice for this assignment was h2o due to its more efficient memory storage and model saving capabilities. Even so, running all of the models with grid searches and with different predictor sets (between level and log numeric vars) took extremely long to produce the desired outputs (about 1.5 hours for the whole rmd).
+
+## (1) Split training data into train and validation sets
+
+Ideally, to achieve the best possible performance in a Kaggle competition (where every hundreth of a percent matters), one should not include a validation set and just make the model comparisons on the cross-validated results. Nonetheless, statistical dogma prevails and begs for the inclusion of a validation set. The researcher is interested in as scientific of an experiment as possible rather than the absolute best performance metric.
+
+For the data splitting, the new sets will also have to be loaded as h2o datasets into our local cluster.
+
+```{r}
+# keep 75% train and 25% validation
+splits <- h2o.splitFrame(as.h2o(train), ratios = 0.75, seed = my_seed)
+data_train <- splits[[1]]
+data_valid <- splits[[2]]
+
+data_test <- as.h2o(test)
+```
+
+For the model building, this report employs already loaded models from the local memory as the grid searches take too long for an RMD to knit successfully. As such, the best models out of the grids were saved as h2o objects and read into this report for evaluation metrics. The hyperparameters of the tuning grids will be explore and the best parameters of the final model of choice will be displayed for each grid search.
+
+After saving the models, we (1) display the AUC values for the train, cross-validated and validation sets to check for overfitting, (2) calculate the predictions for the test set, (3) save them to a .csv file and (4) upload to Kaggle under the right format to benchmark in the competition.
+
+## (2) Random Forest
+
+To decide between the best predictor set, we will run the exact same h2o predictive model grid search with a random forest on the level numeric variables and the log ones, respectively.
+
+The hyperparameters of choice for the tuning grid are:
+* Number of trees grown - 50, 100 or 200
+* Number of variables to choose randomly at each split - 5, 12 or 18
+* Sample Rate for bootstrap samples - 10%, 25% or 66%
+* Depth of trees - 5, 10 or 20
+
+```{r}
+# create parameter grid
+# rf_params <- list(
+#   ntrees = c(50, 100, 200), # number of trees grown
+#   mtries = c(5, 12, 18), # number of variables to choose at each split
+#   sample_rate = c(0.1, 0.25, 0.66), # sample rate for the bootstrap samples
+#   max_depth = c(5, 10, 20) # depth of the trees
+# )
+
+# train model for level
+# rf_grid_level <- h2o.grid(
+#   "randomForest",
+#   x = x_level, y = y,
+#   training_frame = data_train,
+#   grid_id = "rf_model_level",
+#   nfolds = 5,
+#   seed = my_seed,
+#   hyper_params = rf_params,
+#   validation_frame = data_valid,
+#   keep_cross_validation_predictions = TRUE # needed for stacking
+# )
+
+# check AUC for different parameters
+# h2o.getGrid(rf_grid_level@grid_id, sort_by = "auc", decreasing = TRUE)
+
+# save best rf model
+# best_rf_level <- h2o.getModel(
+#   h2o.getGrid(rf_grid_level@grid_id, sort_by = "auc", decreasing = TRUE)@model_ids[[1]]
+# )
+
+# save model to file
+# model_path <- h2o.saveModel(object = best_rf_level,
+#                             path = "F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/",
+#                             force = TRUE)
+
+# import model from file
+best_rf_level <- h2o.loadModel("F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/rf_model_level_model_75")
+
+# Get summary of best parameters
+knitr::kable(best_rf_level@model$model_summary %>% subset(select = 
+                                                        c(number_of_trees, 
+                                                          max_depth,
+                                                          min_leaves, 
+                                                          max_leaves)), caption =
+                "Best RF Level Model - Hyperparameters")
+
+# get AUC for best rf model
+rf_level_auc <- h2o.auc(best_rf_level, train = TRUE, xval = TRUE, valid = TRUE)
+
+# prediction for test set
+prediction <- h2o.predict(best_rf_level, newdata = data_test)
+
+# bind predictions with article id-s
+solution <- cbind(test[, 'article_id'], as.data.frame(prediction[, 3]))
+
+# rename columns
+colnames(solution) <- c('article_id', 'score')
+
+# write to csv
+write_csv(solution, 'F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/submissions/best_rf_level.csv')
+
+### REDO above process for log vars to make comparison table
+# train model for log vars
+# rf_grid_log <- h2o.grid(
+#   "randomForest",
+#   x = x_log, y = y,
+#   training_frame = data_train,
+#   grid_id = "rf_model_log",
+#   nfolds = 5,
+#   seed = my_seed,
+#   hyper_params = rf_params,
+#   validation_frame = data_valid,
+#   keep_cross_validation_predictions = TRUE # needed for stacking
+# )
+# best_rf_log <- h2o.getModel(
+#   h2o.getGrid(rf_grid_log@grid_id, sort_by = "auc", decreasing = TRUE)@model_ids[[1]]
+# )
+# model_path <- h2o.saveModel(object = best_rf_log,
+#                             path = "F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/",
+#                             force = TRUE)
+best_rf_log <- h2o.loadModel("F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/rf_model_log_model_74")
+knitr::kable(subset(best_rf_log@model$model_summary,select = 
+                                                        c(number_of_trees, 
+                                                          max_depth,
+                                                          min_leaves, 
+                                                          max_leaves)), caption =
+                "Best RF Log Model - Hyperparameters")
+rf_log_auc <- h2o.auc(best_rf_log, train = TRUE, xval = TRUE, valid = TRUE)
+prediction <- h2o.predict(best_rf_log, newdata = data_test)
+solution <- cbind(test[, 'article_id'], as.data.frame(prediction[, 3]))
+colnames(solution) <- c('article_id', 'score')
+write_csv(solution, 'F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/submissions/best_rf_log.csv')
+```
+
+Neither of the RF models appear to have overfitted the data as evidence by the AUC comparison table.
+
+Now that we have built two identical RF grids in h2o, we can create a comparison table between the two best models to see their AUC performance. Accordingly, we will decide which predictor set to proceed with (either level numeric vars or log).
+
+```{r}
+### MODEL COMPARISON
+# save models to a list
+my_rf_models <- list(
+  best_rf_level, best_rf_log
+)
+
+# create table with AUC values for different models
+auc_on_valid_rf <- map_df(my_rf_models, ~{
+  tibble(model = .@model_id, RMSE = h2o.rmse(., xval = TRUE), AUC_xval = h2o.auc(., xval = TRUE), AUC_valid = h2o.auc(h2o.performance(., data_valid)))
+}) %>% arrange(AUC_valid)
+
+names(auc_on_valid_rf) <- c("Model", "CV RMSE","CV AUC", "Validation Set AUC")
+
+# print table
+knitr::kable(auc_on_valid_rf, caption = "Performance comparison of RF models w/ different predictors", digits = 4)
+```
+
+We will proceed with the log predictor set. The AUC performance gain is barely noticeable, however.
+
+## (3) Gradient Boosting
+
+We will run the log predictor set on an h2o predictive model grid search with a gradient boosting machine.
+
+The hyperparameters of choice for the tuning grid are:
+* Number of trees grown - 10, 50, 100 or 300 (as GBM tends to require more trees)
+* Learning rate - 0.01, 0.05, 0.1 or 0.3
+* Sample Rate for bootstrap samples - 20%, 50%, 80% or 100%
+* Depth of trees - 2 or 5
+
+```{r}
+# create parameter grid
+# gbm_params <- list(
+#   learn_rate = c(0.01, 0.05, 0.1, 0.3),
+#   ntrees = c(10, 50, 100, 300),
+#   max_depth = c(2, 5),
+#   sample_rate = c(0.2, 0.5, 0.8, 1)
+# )
+
+# train model
+# gbm_grid <- h2o.grid(
+#   "gbm", x = x_log, y = y,
+#   grid_id = "gbm_model",
+#   training_frame = data_train,
+#   nfolds = 5,
+#   seed = my_seed,
+#   hyper_params = gbm_params,
+#   validation_frame = data_valid,
+#   keep_cross_validation_predictions = TRUE # needed for stacking
+# )
+
+# check AUC for different parameters
+# h2o.getGrid(gbm_grid@grid_id, sort_by = "auc", decreasing = TRUE)
+
+# save best gbm model
+# best_gbm <- h2o.getModel(
+#   h2o.getGrid(gbm_grid@grid_id, sort_by = "auc", decreasing = TRUE)@model_ids[[1]]
+# )
+
+# save model to file
+# model_path <- h2o.saveModel(object = best_gbm,
+#                             path = "F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/",
+#                             force = TRUE)
+
+# import model from file
+best_gbm <- h2o.loadModel("F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/gbm_model_model_86")
+
+# Get summary of best parameters
+knitr::kable(best_gbm@model$model_summary %>% subset(select = 
+                                                        c(number_of_trees, 
+                                                          max_depth,
+                                                          min_leaves, 
+                                                          max_leaves)), caption =
+                "Best GBM Model - Hyperparameters")
+
+# get AUC for best gbm model
+gbm_auc <- h2o.auc(best_gbm, train = TRUE, xval = TRUE, valid = TRUE)
+
+knitr::kable(t(gbm_auc), caption = "Best GBM Model - Train, CV & Validation AUC")
+
+# prediction for test set
+prediction <- h2o.predict(best_gbm, newdata = data_test)
+
+# bind predictions with article id-s
+solution <- cbind(test[, 'article_id'], as.data.frame(prediction[, 3]))
+
+# rename columns
+colnames(solution) <- c('article_id', 'score')
+
+# write to csv
+write_csv(solution, 'F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/submissions/best_gbm.csv')
+```
+
+The best GBM model appears to have a higher AUC on the training set, however it is not extremely high in comparison to the CV and Validation AUCs.
+
+## (4) Lasso model
+
+The lambda_search parameter set to true means that during the training many different values are tried. The one resulting in the lowest cross-validated error (loss function dependent) is picked for the final Lasso (same applies for the Ridge model). We print the lambda value for the final model (same applies for the Ridge model).
+
+```{r}
+# train lasso model with lambda search
+# lasso_model <- h2o.glm(
+#   x_log, y,
+#   training_frame = data_train,
+#   model_id = "lasso_model",
+#   family = "binomial",
+#   alpha = 1,
+#   lambda_search = TRUE,
+#   seed = my_seed,
+#   nfolds = 5,
+#   validation_frame = data_valid,
+#   keep_cross_validation_predictions = TRUE # needed for stacking
+# )
+
+# save model to file
+# model_path <- h2o.saveModel(object = lasso_model,
+#                             path = "F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/",
+#                             force = TRUE)
+
+# import model from file
+best_lasso <- h2o.loadModel("F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/lasso_model")
+
+print(paste("The best identified lambda for the Lasso model is",
+            best_lasso@model$lambda_best))
+
+# get AUC for best lambda
+lasso_auc <- h2o.auc(best_lasso, train = TRUE, xval = TRUE, valid = TRUE)
+
+knitr::kable(t(lasso_auc), caption = "Best Lasso Model - Train, CV & Validation AUC")
+
+# prediction for test set
+prediction <- h2o.predict(best_lasso, newdata = data_test)
+
+# bind predictions with article id-s
+solution <- cbind(test[, 'article_id'], as.data.frame(prediction[, 3]))
+
+# rename columns
+colnames(solution) <- c('article_id', 'score')
+
+# write to csv
+write_csv(solution, 'F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/submissions/best_lasso.csv')
+```
+
+According to the AUC metrics, the Lasso model does not overfit the data.
+
+## (5) Ridge model
+
+```{r}
+# train ridge model with lambda search
+# ridge_model <- h2o.glm(
+#   x_log, y,
+#   training_frame = data_train,
+#   model_id = "ridge_model",
+#   family = "binomial",
+#   alpha = 0,
+#   lambda_search = TRUE,
+#   seed = my_seed,
+#   nfolds = 5,
+#   validation_frame = data_valid,
+#   keep_cross_validation_predictions = TRUE
+# )
+
+# save model to file
+# model_path <- h2o.saveModel(object = ridge_model,
+#                             path = "F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/",
+#                             force = TRUE)
+
+# import model from file
+best_ridge <- h2o.loadModel("F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/ridge_model")
+
+print(paste("The best identified lambda for the Ridge model is",
+            best_ridge@model$lambda_best))
+
+# get AUC for best lambda
+ridge_auc <- h2o.auc(best_ridge, train = TRUE, xval = TRUE, valid = TRUE)
+
+knitr::kable(t(ridge_auc), caption = "Best Ridge Model - Train, CV & Validation AUC")
+
+# prediction for test set
+prediction <- h2o.predict(best_ridge, newdata = data_test)
+
+# bind predictions with article id-s
+solution <- cbind(test[, 'article_id'], as.data.frame(prediction[, 3]))
+
+# rename columns
+colnames(solution) <- c('article_id', 'score')
+
+# write to csv
+write_csv(solution, 'F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/submissions/best_ridge.csv')
+```
+
+According to the AUC metrics, the Ridge model does not overfit the data.
+
+## (6) Deep Neural Network
+
+We will run the log predictor set on an h2o predictive model grid search with a deeplearning algorithm (dense neural networks).
+
+The hyperparameters of choice for the tuning grid are (limited computational power restricted tinkering with more parameters):
+* Hidden layers (no. & size) - 32 & 32, 64 & 64 or 128 & 128
+* Dropout ratios for the hidden layers - 40% & 60% or 20% & 80%
+* Learning rate - 0.01 or 0.02
+* ReLu activation function
+* 30 epochs
+* 3 stopping rounds for unimproved performance stop limit
+* 1% stopping tolerance i.e. when misclassification does not improve by >=1% for 3 scoring events
+
+```{r}
+# create parameter grid
+# nn_params <- list(
+#   hidden=list(c(32,32),c(64,64),c(128,128)),
+#   hidden_dropout_ratios = list(c(0.4, 0.6),c(0.2,0.8)),
+#   rate=c(0.01,0.02) # learning rate
+# )
+
+# train model
+# nn_grid <- h2o.grid(
+#   algorithm="deeplearning",
+#   x = x_log, y = y,
+#   training_frame = data_train,
+#   grid_id = "nn_model",
+#   standardize = TRUE,
+#   seed = my_seed,
+#   nfolds = 5,
+#   validation_frame = data_valid,
+#   hyper_params = nn_params,
+#   activation = "RectifierWithDropout", # ReLu + dropout because of dropout layers
+#   epochs = 30, # standard number of epochs for computer not to catch on fire
+#   stopping_rounds = 3, # 3 consecutive rounds of unimproved performance
+#   stopping_metric = "AUC", # stopping metric of choice as this is classification
+#   stopping_tolerance = 0.01, # stop when misclassification does not improve by >=1% for 3 scoring events
+#   keep_cross_validation_predictions = TRUE # needed for stacking
+# )
+
+# check AUC for different parameters
+# h2o.getGrid(nn_grid@grid_id, sort_by = "auc", decreasing = TRUE)
+
+# save best gbm model
+# best_nn <- h2o.getModel(
+#   h2o.getGrid(nn_grid@grid_id, sort_by = "auc", decreasing = TRUE)@model_ids[[1]]
+# )
+
+# save model to file
+# model_path <- h2o.saveModel(object = best_nn,
+#                             path = "F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/",
+#                             force = TRUE)
+
+# import model from file
+best_nn <- h2o.loadModel("F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/nn_model_model_9")
+
+knitr::kable(best_nn@model$model_summary %>% subset(select = 
+                                                        c(layer, 
+                                                          units,
+                                                          type, 
+                                                          dropout,
+                                                          mean_rate,
+                                                          mean_weight,
+                                                          mean_bias)), caption =
+                "Best Deeplearning (dense NN) Model - Hyperparameters")
+
+# get AUC for best neural network model
+nn_auc <- h2o.auc(best_nn, train = TRUE, xval = TRUE, valid = TRUE)
+
+knitr::kable(t(nn_auc), caption = "Best Deeplearning Model - Train, CV & Validation AUC")
+
+# prediction for test set
+prediction <- h2o.predict(best_nn, newdata = data_test)
+
+# bind predictions with article id-s
+solution <- cbind(test[, 'article_id'], as.data.frame(prediction[, 3]))
+
+# rename columns
+colnames(solution) <- c('article_id', 'score')
+
+# write to csv
+write_csv(solution, 'F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/submissions/best_nn.csv')
+```
+
+According to the AUC metrics, the deeplearning model does not appear to have overfitted the data.
+
+## (7) Stacked model
+
+Lastly, we built a stacked ensemble model (combination of all the previously built models) with a glm (penalized linear model) as the meta learner. 
+
+Due to its nature of working directly with the base models' predictions rather than their parameters, stacked models work best when the base learner models are not highly correlated.
+
+```{r}
+# save models to a list
+base_learners <- list(
+  best_rf_log, best_gbm, best_nn, best_ridge, best_lasso
+)
+
+# check correlation between models
+h2o.model_correlation_heatmap(base_learners, data_valid)
+```
+
+Because of the high correlation between the two penalized linear models, the one with better performance will be used for stacking (i.e. Ridge).
+
+```{r}
+# check correlation between variable importance of models
+h2o.varimp_heatmap(base_learners)
+```
+
+Overall, we can see that the deeplearning model kept variable importance quite even throughout, while the GBM model (perhaps due to sampling parameters) stuck to self references variable (capturing a staggering 15% importance). It is interesting to see that the deeplearning model attribute a much lower importance to the same variable. The above graph clearly shows the differences between the 4 types of models used, spanning linear (penalized), bagged, boosted and neural networks.
+
+```{r}
+# modify base learners to only keep 1 of the penalized linear models
+base_learners <- list(
+  best_rf_log, best_gbm, best_nn, best_ridge
+)
+
+# stacked ensemble model with glm as the meta learner
+ensemble_model <- h2o.stackedEnsemble(
+  x = x_log, y = y,
+  model_id = "stacked_model",
+  training_frame = data_train,
+  base_models = base_learners,
+  validation_frame = data_valid,
+  seed = my_seed,
+  metalearner_nfolds = 5
+)
+
+# save model to file
+model_path <- h2o.saveModel(object = ensemble_model,
+                            path = "F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/",
+                            force = TRUE)
+
+# import model from file
+best_stacked <- h2o.loadModel("F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/models/stacked_model")
+
+# get AUC for best neural network model
+stacked_auc <- h2o.auc(best_stacked, train = TRUE, xval = TRUE, valid = TRUE)
+
+knitr::kable(t(stacked_auc), caption = "Best Stacked Model - Train, CV & Validation AUC")
+
+# prediction for test set
+prediction <- h2o.predict(best_stacked, newdata = data_test)
+
+# bind predictions with article id-s
+solution <- cbind(test[, 'article_id'], as.data.frame(prediction[, 3]))
+
+# rename columns
+colnames(solution) <- c('article_id', 'score')
+
+# write to csv
+write_csv(solution, 'F:/OneDrive - Central European University/Courses/Winter_Term/Data Science 2/kaggle-classification-competition/submissions/best_stacked.csv')
+```
+
+According to the AUC metrics, the stacked model does not appear to do much justice for performance increase but it rather tends to overfit the data.
+
+# Model Comparison
+
+Taking a look at a comparison table between all the models:
+
+```{r}
+### MODEL COMPARISON
+# save models to a list
+my_models <- list(
+  best_rf_log, best_rf_level,
+  best_gbm, best_nn, 
+  best_ridge, best_lasso,
+  best_stacked
+)
+
+# create table with AUC values for different models
+auc_on_valid <- map_df(my_models, ~{
+  tibble(model = .@model_id, RMSE = h2o.rmse(., xval = TRUE), AUC_xval = h2o.auc(., xval = TRUE), AUC_valid = h2o.auc(h2o.performance(., data_valid)))
+}) %>% arrange(AUC_valid)
+
+names(auc_on_valid) <- c("Model", "CV RMSE","CV AUC", "Validation Set AUC")
+
+# print table
+knitr::kable(auc_on_valid, caption = "Performance comparison of all models", digits = 4)
+```
+
+We can see that by a mere 0.1%, the Validation set AUC for the stacked model is better than the GBM. However, as the stacked models appears more likely to overfit the data, the final model of choice is the GBM. On a competition level, a few matters could have been taken to ensure as best of an AUC performance as possible, namely:
+* The log and level numeric variables should have been kept
+* None of the "redundant" variables should have been removed
+* The article IDs could have been kept (even this would have improved the AUC by a slight few tenths of a percentage)
+* No validation set should have been used
+* The RF models could have been evaluated on Out of Bag Samples to reduce the need for CV
+
+Overall if not feature selection and sampling would have been done, the AUC performance could have matched the top submissions in the Kaggle competition.
+
+## ROC Curve
+
+Plotting the ROC curve of the best model, in this case the Gradient Boosting Machine, we get the following result.
+
+```{r}
+# plot ROC curve for best model
+# function to get performance metrics for the plot
+getPerformanceMetrics <- function(model, newdata = NULL, xval = FALSE) {
+  h2o.performance(model, newdata = newdata, xval = xval)@metrics$thresholds_and_metric_scores %>%
+    as_tibble() %>%
+    mutate(model = model@model_id)
+}
+
+# calculate performance metrics
+best_performance <- getPerformanceMetrics(best_gbm, xval = TRUE)
+
+# create plot
+ggplot(best_performance, aes(fpr, tpr)) +
+  geom_path(color = "red4", size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  coord_fixed() +
+  labs(x = "False Positive Rate", y = "True Positive Rate", title = "ROC curve for best GBM model")+
+  theme_bw()
+```
+
+## Variable Importance Plots
+
+As a final close look, we can take a look at the variable importance plot for the GBM model.
+
+```{r}
+# check variable importance
+h2o.varimp_plot(best_gbm)
+```
+
+# Conclusion
+
+Overall, this Kaggle competition shows the vast differences between model types as well as presents the duality in statistics of choosing between the best possible performance and sticking to the heralded statistics principles (holding on for dear life). The morale of the story is: forget the statistics playbook when you are in a competition, the rules are there to be bent, twisted and flipped.
